@@ -390,7 +390,7 @@ jobs:
         run: |
           docker-compose pull --include-deps ${{ steps.get-services.outputs.services }}
           docker-compose up -d ${{ steps.get-services.outputs.services }}
-          sleep {{ inputs.api-proctor-delay-seconds }}s
+          sleep ${{ inputs.api-proctor-delay-seconds }}s
 
       - name: Run API Proctor tests
         env:
