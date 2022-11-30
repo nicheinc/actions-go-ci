@@ -1,0 +1,454 @@
+name: Build, Test, and Ship
+permissions:
+  contents: write
+  pull-requests: write
+on:
+  workflow_call:
+    inputs:
+      services:
+        description: >
+          A JSON array containing the names of all services in the repo: the
+          eponymous microservice itself, any associated Kafka consumers, etc.
+        required: true
+        type: string
+      run-api-proctor-tests:
+        description: Run the API Proctor tests associated with this repo.
+        default: true
+        type: boolean
+      api-proctor-timeout-minutes:
+        description: The timeout in minutes for running API Proctor tests.
+        default: 30
+        type: number
+      bypass-dev-protections:
+        description: >
+          Use custom user to override branch protections when
+          pushing directly to dev
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      DEV_AWS_CREDENTIALS:
+        required: true
+      ECR_ACCESS_KEY_ID:
+        required: true
+      ECR_SECRET_ACCESS_KEY:
+        required: true
+      NPM_WRITE_TOKEN:
+        required: true
+      SLACK_BOT_TOKEN:
+        required: true
+      AWS_ACCOUNT_ID:
+        required: true
+
+jobs:
+  # Retrieve the minimum Go version from go.mod and output a matrix of all Go
+  # versions released since. Skip on release.
+  go-versions:
+    name: Get supported Go versions
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'release' }}
+    outputs:
+      matrix: ${{ steps.versions.outputs.matrix }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Set Go versions
+        uses: arnested/go-version-action@v1
+        id: versions
+
+  # Run unit tests and go vet with each supported Go version. Skip on release.
+  unit-test-and-vet:
+    name: Unit test and vet with Go ${{ matrix.go }}
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'release' }}
+    needs: go-versions
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ${{ fromJSON(needs.go-versions.outputs.matrix) }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Install Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: Test
+        run: |
+          go test -v -cover -race ./...
+
+      - name: Vet
+        run: |
+          go vet ./...
+
+  # Build images for api-proctor and, on release, ship final images to ECR.
+  build-and-ship-images:
+    name: Build ${{ matrix.service }} images
+    runs-on: ubuntu-latest
+    outputs:
+      appversion: ${{ steps.check-version-change.outputs.appversion }}
+      chartversion: ${{ steps.check-version-change.outputs.chartversion }}
+      appchange: ${{ steps.check-version-change.outputs.appchange }}
+      chartchange: ${{ steps.check-version-change.outputs.chartchange }}
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJson(inputs.services) }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      # Using the version file and GitHub tags, check what new versions we have
+      - name: Check Changed Versions
+        id: check-version-change
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          . version.env
+          chartchange="true"
+          appchange="true"
+          git fetch origin --tags
+          for tag in $(git tag -l); do
+            if [[ "${tag}" == "${APPVERSION}" ]]; then
+              appchange="false"
+            elif [[ "${tag}" == "helm-chart-${CHARTVERSION}" ]]; then
+              chartchange="false"
+            fi
+          done
+          echo "appversion=${APPVERSION}" >> $GITHUB_OUTPUT
+          echo "chartversion=${CHARTVERSION}" >> $GITHUB_OUTPUT
+          echo "appchange=${appchange}" >> $GITHUB_OUTPUT
+          echo "chartchange=${chartchange}" >> $GITHUB_OUTPUT
+
+      # On merge to dev make sure if the app changed
+      # but the chart version didn't we error out
+      - name: Ensure Version Changed
+        if: |
+          github.event_name == 'push' &&
+          steps.check-version-change.outputs.appchange == 'true' &&
+          steps.check-version-change.outputs.chartchange != 'true'
+        run: |
+          exit 1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      # Since jobs can't access local files produced by other jobs, we build and
+      # upload a GitHub artifact containing a TAR of the ci-tagged service
+      # image, to be downloaded in the run-api-proctor-tests job.
+      - name: Build image for api-proctor tests
+        if: inputs.run-api-proctor-tests
+        uses: docker/build-push-action@v3
+        with:
+          context: .
+          file: ./cmd/${{ matrix.service }}/Dockerfile
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          outputs: type=docker,dest=${{ matrix.service }}.tar
+          tags: ${{ matrix.service }}:ci
+      - name: Upload docker image artifact
+        if: inputs.run-api-proctor-tests
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ matrix.service }}
+          path: ${{ matrix.service }}.tar
+          retention-days: 1
+
+      # On release, build service images for target platforms and push to ECR.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        if: |
+          github.event_name == 'push' &&
+          steps.check-version-change.outputs.appchange == 'true'
+        with:
+          aws-access-key-id: ${{ secrets.ECR_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.ECR_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        if: |
+          github.event_name == 'push' &&
+          steps.check-version-change.outputs.appchange == 'true'
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build and ship final images
+        uses: docker/build-push-action@v3
+        if: |
+          github.event_name == 'push' &&
+          steps.check-version-change.outputs.appchange == 'true'
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ matrix.service }}
+          IMAGE_TAG: ${{ steps.check-version-change.outputs.appversion }}
+        with:
+          context: .
+          file: ./cmd/${{ matrix.service }}/Dockerfile
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+
+  build-for-target-platforms:
+    name: Verify ${{ matrix.service }} images can be built on target platforms
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJson(inputs.services) }}
+    if: github.event_name == 'pull_request' && !github.event.pull_request.draft
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build images on target platforms
+        uses: docker/build-push-action@v3
+        with:
+          context: .
+          file: ./cmd/${{ matrix.service }}/Dockerfile
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+  run-api-proctor-tests:
+    name: Run API Proctor tests
+    if: inputs.run-api-proctor-tests
+    runs-on: ubuntu-latest
+    needs: build-and-ship-images
+    timeout-minutes: ${{ inputs.api-proctor-timeout-minutes }}
+    env:
+      PGADMIN_PORT: 5000
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_SERVER: postgres
+      POSTGRES_PORT: 5432
+    steps:
+      - name: Checkout development repo
+        uses: actions/checkout@v3
+        with:
+          repository: nicheinc/development
+          token: ${{ secrets.NPM_WRITE_TOKEN }}
+          submodules: true
+
+      - name: Download docker image artifacts
+        uses: actions/download-artifact@v3
+
+      - name: Set up yq for YAML processing
+        uses: mikefarah/yq@v4.27.3
+
+      - name: Get relevant services as a space-separated string
+        id: get-services
+        shell: bash
+        run: |
+          tools=`yq -o=json '.services
+            | with_entries(select(.value.profiles.[] | contains("tools")))
+            | to_entries
+            | map(.key)' docker-compose.yml`
+          all_services=`yq -o=json '.services | keys' docker-compose.yml`
+          non_tools=`jq --null-input "${all_services} - ${tools}"`
+          input_services='${{ inputs.services }}'
+          services=`jq --null-input "${input_services} - (${input_services} - ${non_tools})"`
+          echo "services=`jq -r 'join(" ")' <<< ${services}`" >> $GITHUB_OUTPUT
+
+      - name: Load docker images
+        shell: bash
+        run: |
+          for service in ${{ steps.get-services.outputs.services }}; do
+            docker load --input ${service}/${service}.tar
+          done
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.ECR_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.ECR_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      # TODO: Once we update the development repo itself to use latest images
+      # from ECR (https://app.asana.com/0/1199932090708798/1202699911962363/f),
+      # this step will be unnecessary.
+      - name: Use latest service images from ECR
+        run: sed -i 's/${USER:?USER}/${{ steps.login-ecr.outputs.registry }}/' docker-compose.yml
+
+      - name: Create docker-compose override and AWS credentials files
+        env:
+          ENCODED_CREDENTIALS: ${{ secrets.DEV_AWS_CREDENTIALS }}
+        shell: bash
+        run: |
+          yq -n ".version = \"3.7\"" > docker-compose.override.yaml
+          for service in ${{ steps.get-services.outputs.services }}; do
+            yq -i ".services.${service}.image = \"${service}:ci\"" docker-compose.override.yaml
+          done
+          yq eval-all --inplace 'select(fileIndex == 0) * select(fileIndex == 1)' docker-compose.override.yaml ${{ github.workspace }}/docker-compose.ci-override.yml
+          echo docker-compose.override.yaml:
+          cat docker-compose.override.yaml
+          echo $ENCODED_CREDENTIALS | base64 -di > vault/aws_credentials
+
+      # TODO: This is a hack to place empty secret files in the vault directory
+      # (to satisfy docker-compose.yml requirements) without actually retrieving
+      # them from vault.
+      - name: Retrieve vault secrets
+        shell: bash
+        run: |
+          touch vault/website.secrets.env
+          touch vault/landingpageadmin.secrets.env
+
+      - name: Parse service dependencies
+        id: parse-deps
+        run: |
+          # Traverse depends_on values to build the unified dependency set.
+          declare -A work_set # Nodes to be visited
+          declare -A deps # Nodes already in the dependency set
+          # Initialize the work set to the services from this repo.
+          for service in ${{ steps.get-services.outputs.services }}; do
+            work_set[${service}]=1
+          done
+          # While the work set is nonempty, pop and visit an arbitrary node.
+          while [[ ${#work_set[@]} -gt 0 ]]; do
+            keys=(${!work_set[@]})
+            next=${keys[0]}
+            unset work_set[${next}]
+            # Add the next node to the dependency set, and add any of its
+            # unvisited dependencies to the work set.
+            deps[${next}]=1
+            next_deps=$(yq ".services.${next}.depends_on[]" docker-compose.yml)
+            for next_dep in ${next_deps}; do
+              if [[ ! ${deps[${next_dep}]} ]]; then
+                work_set[${next_dep}]=1
+              fi
+            done
+          done
+          echo Dependencies: ${!deps[@]}
+          echo "deps=${!deps[@]}" >> $GITHUB_OUTPUT
+
+      - name: Start postgres and create service databases and roles
+        shell: bash
+        run: |
+          docker-compose up -d postgres
+          timeout 1m bash -c 'until docker-compose run postgres pg_isready -d postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres; do sleep 1s; done'
+          declare -A dbs
+          conn_regex='postgres://(\w*):(\w*)@\$\{POSTGRES_SERVER\}/(\w*)'
+          for dependency in ${{ steps.parse-deps.outputs.deps }}; do
+            # Parse DB from POSTGRES_CONNECTION. Parse roles and passwords from sql/roles.sql
+            conn=$(yq ".services.${dependency}.environment.POSTGRES_CONNECTION" docker-compose.yml)
+            if [[ ${conn} =~ ${conn_regex} ]]; then
+              db=${BASH_REMATCH[3]}
+              if [[ ! ${dbs[${db}]} ]]; then
+                dbs[${db}]=1
+                docker exec -i -e PGPASSWORD=${POSTGRES_PASSWORD} postgres \
+                  psql -h 0.0.0.0 -U ${POSTGRES_USER} -a -c "CREATE DATABASE ${db}"
+                context=$(yq ".services.${dependency}.build.context" docker-compose.yml)
+                roles="${context}/sql/roles.sql"
+                if [[ -f ${roles} ]]; then
+                  docker compose cp ${roles} postgres:roles.sql
+                  docker exec -i -e PGPASSWORD=${POSTGRES_PASSWORD} postgres \
+                    psql -h 0.0.0.0 -U ${POSTGRES_USER} -d ${db} -a -f roles.sql
+                fi
+                extensions="${context}/sql/extensions.sql"
+                if [[ -f ${extensions} ]]; then
+                  docker compose cp ${extensions} postgres:extensions.sql
+                  docker exec -i -e PGPASSWORD=${POSTGRES_PASSWORD} postgres \
+                    psql -h 0.0.0.0 -U ${POSTGRES_USER} -d ${db} -a -f extensions.sql
+                fi
+              else
+                echo ${db} database already initialized
+              fi
+            fi
+          done
+
+      - name: Launch services with dependencies via docker-compose
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        shell: bash
+        run: |
+          docker-compose pull --include-deps ${{ steps.get-services.outputs.services }}
+          docker-compose up -d ${{ steps.get-services.outputs.services }}
+          sleep 1m
+
+      - name: Run API Proctor tests
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        shell: bash
+        run: |
+          docker run --rm --name api-proctor --network host \
+            -e READ_POSTGRES_CONNECTION=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@localhost:${POSTGRES_PORT} \
+            -e WRITE_POSTGRES_CONNECTION=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@localhost:${POSTGRES_PORT} \
+            -e NODE_ENV=ci \
+            $ECR_REGISTRY/api-proctor:latest \
+            tests/${{ github.event.repository.name }}/ --testPathIgnorePatterns=/src/ --passWithNoTests
+
+      - name: Docker Compose logs
+        if: success() || failure()
+        shell: bash
+        run: |
+          for service in ${{ steps.get-services.outputs.services }}; do
+            echo "::group::${service} logs"
+            docker-compose logs ${service}
+            echo "::endgroup::"
+          done
+          echo "::group::kafka logs"
+          docker-compose logs kafka || echo "kafka not running"
+          echo "::endgroup::"
+          echo "::group::postgres logs"
+          docker-compose logs postgres || echo "postgres not running"
+          echo "::endgroup::"
+
+  # Builds and ships Helm charts if necessary
+  push-charts:
+    name: Push Helm Charts
+    if: ${{ github.event_name == 'push' || github.event_name == 'release' }}
+    uses: nicheinc/actions/.github/workflows/push-helm-charts.yaml@405c3f7cd949c0c557c85199d3206968916e5f6f
+    with:
+      appchange: ${{ needs.build-and-ship-images.outputs.appchange }}
+      appversion: ${{ needs.build-and-ship-images.outputs.appversion }}
+      chartchange: ${{ needs.build-and-ship-images.outputs.chartchange }}
+      chartversion: ${{ needs.build-and-ship-images.outputs.chartversion }}
+      bypass-dev-protections: ${{ inputs.bypass-dev-protections }}
+    secrets: inherit
+    needs: build-and-ship-images
+
+  # Creates and tags Release in Github for Service
+  create-service-release:
+    name: Tag and Create Release
+    if: |
+      github.event_name == 'push' &&
+      needs.build-and-ship-images.outputs.appchange == 'true'
+    runs-on: ubuntu-latest
+    needs: build-and-ship-images
+    steps:
+      - name: Create Release for Service image
+        id: create-service-release
+        uses: ncipollo/release-action@3d2de22e3d0beab188d8129c27f103d8e91bf13a
+        with:
+          tag: "${{ needs.build-and-ship-images.outputs.appversion }}"
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Notify in Slack
+      - name: Post image build to a Slack channel
+        uses: slackapi/slack-github-action@v1.17.0
+        with:
+          # Post Release Status result to #deployment
+          channel-id: 'C2C5JV162'
+          slack-message: |
+            GitHub has built `${{ github.event.repository.name }}:${{ needs.build-and-ship-images.outputs.appversion }}`
+            for <${{ steps.create-service-release.outputs.html_url }}|release>. :shipitparrot:
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
