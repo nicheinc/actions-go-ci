@@ -1,7 +1,7 @@
 # actions-go-ci
 
-A [GitHub Action](https://docs.github.com/en/actions) providing CI/CD for our Go
-service repos.
+A reusable [GitHub Actions](https://docs.github.com/en/actions) workflow
+providing CI/CD for our Go service repos.
 
 This action is designed only for internal use but must be public due to current
 limitations on [reusable
