@@ -1,4 +1,4 @@
-name: Build, Test, and Ship
+name: CI
 permissions:
   contents: write
   pull-requests: write
