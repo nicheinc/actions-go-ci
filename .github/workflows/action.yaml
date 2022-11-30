@@ -15,6 +15,15 @@ on:
         description: Run the API Proctor tests associated with this repo.
         default: true
         type: boolean
+      api-proctor-delay-seconds:
+        description: >
+          The number of seconds to sleep after starting services in Docker
+          before running the API Proctor tests, to give services enough startup
+          time. Set this to the smallest value such that the tests pass
+          consistently. This input will hopefully become unnecessary in the
+          future, if we can await service readiness automatically.
+        default: 0
+        type: number
       api-proctor-timeout-minutes:
         description: The timeout in minutes for running API Proctor tests.
         default: 30
@@ -381,7 +390,7 @@ jobs:
         run: |
           docker-compose pull --include-deps ${{ steps.get-services.outputs.services }}
           docker-compose up -d ${{ steps.get-services.outputs.services }}
-          sleep 1m
+          sleep {{ inputs.api-proctor-delay-seconds }}s
 
       - name: Run API Proctor tests
         env:
