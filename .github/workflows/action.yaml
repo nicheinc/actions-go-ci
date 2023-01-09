@@ -250,6 +250,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: nicheinc/development
+          ref: x/override-dns
           token: ${{ secrets.NPM_WRITE_TOKEN }}
           submodules: true
 
@@ -302,13 +303,12 @@ jobs:
           ENCODED_CREDENTIALS: ${{ secrets.DEV_AWS_CREDENTIALS }}
         shell: bash
         run: |
-          yq -n ".version = \"3.7\"" > docker-compose.override.yaml
           for service in ${{ steps.get-services.outputs.services }}; do
-            yq -i ".services.${service}.image = \"${service}:ci\"" docker-compose.override.yaml
+            yq -i ".services.${service}.image = \"${service}:ci\"" ${{ github.workspace }}/docker-compose.ci-override.yml
           done
-          yq eval-all --inplace 'select(fileIndex == 0) * select(fileIndex == 1)' docker-compose.override.yaml ${{ github.workspace }}/docker-compose.ci-override.yml
-          echo docker-compose.override.yaml:
-          cat docker-compose.override.yaml
+          yq eval-all --inplace 'select(fileIndex == 0) * select(fileIndex == 1)' docker-compose.yml ${{ github.workspace }}/docker-compose.ci-override.yml
+          echo ${{ github.workspace }}/docker-compose.ci-override.yml:
+          cat ${{ github.workspace }}/docker-compose.ci-override.yml
           echo $ENCODED_CREDENTIALS | base64 -di > vault/aws_credentials
 
       # TODO: This is a hack to place empty secret files in the vault directory
